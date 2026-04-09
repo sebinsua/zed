@@ -6228,6 +6228,10 @@ impl fs::Watcher for NullWatcher {
         Ok(())
     }
 
+    fn add_followed_path(&self, _removable_path: &Path, _watched_path: &Path) -> Result<()> {
+        Ok(())
+    }
+
     fn remove(&self, _path: &Path) -> Result<()> {
         Ok(())
     }

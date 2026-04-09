@@ -14,6 +14,60 @@ use serde_json::json;
 use tempfile::TempDir;
 use util::path;
 
+#[cfg(target_os = "linux")]
+async fn collect_matching_event_paths(
+    executor: &BackgroundExecutor,
+    events: &mut (impl StreamExt<Item = Vec<PathEvent>> + Unpin),
+    expected_paths: &BTreeSet<PathBuf>,
+) -> BTreeSet<PathBuf> {
+    let mut matched_paths = BTreeSet::new();
+    let mut ticks = 0;
+
+    while ticks < 300 {
+        if let Some(batch) = events.next().fuse().now_or_never().flatten() {
+            for event in batch {
+                if expected_paths.contains(&event.path) {
+                    matched_paths.insert(event.path);
+                }
+            }
+            if matched_paths.len() == expected_paths.len() {
+                break;
+            }
+            ticks = 0;
+        } else {
+            ticks += 1;
+            executor.timer(Duration::from_millis(10)).await;
+        }
+    }
+
+    matched_paths
+}
+
+#[cfg(target_os = "linux")]
+async fn collect_matching_events(
+    executor: &BackgroundExecutor,
+    events: &mut (impl StreamExt<Item = Vec<PathEvent>> + Unpin),
+    predicate: impl Fn(&PathEvent) -> bool,
+) -> Vec<PathEvent> {
+    let mut matched_events = Vec::new();
+    let mut ticks = 0;
+
+    while ticks < 300 {
+        if let Some(batch) = events.next().fuse().now_or_never().flatten() {
+            matched_events.extend(batch.into_iter().filter(|event| predicate(event)));
+            if !matched_events.is_empty() {
+                break;
+            }
+            ticks = 0;
+        } else {
+            ticks += 1;
+            executor.timer(Duration::from_millis(10)).await;
+        }
+    }
+
+    matched_events
+}
+
 #[gpui::test]
 async fn test_fake_fs(executor: BackgroundExecutor) {
     let fs = FakeFs::new(executor.clone());
@@ -625,6 +679,114 @@ async fn test_realfs_symlink_loop_metadata(executor: BackgroundExecutor) {
     assert!(!metadata.is_fifo);
     assert!(!metadata.is_executable);
     // don't care about len or mtime on symlinks?
+}
+
+#[gpui::test]
+#[cfg(target_os = "linux")]
+async fn test_realfs_watch_symlink_alias_reports_events_for_both_registered_paths(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
+    cx.executor().allow_parking();
+
+    let tempdir = TempDir::new().unwrap();
+    let root = tempdir.path();
+    let fs = RealFs::new(None, executor.clone());
+
+    let real_dir = root.join("real");
+    let alias_dir = root.join("alias");
+    let real_file = real_dir.join("file.txt");
+    let alias_file = alias_dir.join("file.txt");
+
+    std::fs::create_dir_all(&real_dir).unwrap();
+    std::fs::write(&real_file, "before").unwrap();
+    std::os::unix::fs::symlink("real", &alias_dir).unwrap();
+
+    let (mut events, watcher) = fs.watch(root, Duration::from_millis(10)).await;
+    watcher.add(&real_dir).unwrap();
+    watcher.add(&alias_dir).unwrap();
+
+    fs.write(&real_file, b"after").await.unwrap();
+
+    let expected_paths = BTreeSet::from([real_file.clone(), alias_file.clone()]);
+    let matched_paths = collect_matching_event_paths(&executor, &mut events, &expected_paths).await;
+
+    assert_eq!(matched_paths, expected_paths);
+}
+
+#[gpui::test]
+#[cfg(target_os = "linux")]
+async fn test_realfs_watch_symlink_alias_remove_preserves_other_registration(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
+    cx.executor().allow_parking();
+
+    let tempdir = TempDir::new().unwrap();
+    let root = tempdir.path();
+    let fs = RealFs::new(None, executor.clone());
+
+    let real_dir = root.join("real");
+    let alias_dir = root.join("alias");
+    let real_file = real_dir.join("file.txt");
+    let alias_file = alias_dir.join("file.txt");
+
+    std::fs::create_dir_all(&real_dir).unwrap();
+    std::fs::write(&real_file, "before").unwrap();
+    std::os::unix::fs::symlink("real", &alias_dir).unwrap();
+
+    let (mut events, watcher) = fs.watch(root, Duration::from_millis(10)).await;
+    watcher.add(&real_dir).unwrap();
+    watcher.add(&alias_dir).unwrap();
+
+    fs.write(&real_file, b"first").await.unwrap();
+    let initial_expected_paths = BTreeSet::from([real_file.clone(), alias_file.clone()]);
+    let initial_matches =
+        collect_matching_event_paths(&executor, &mut events, &initial_expected_paths).await;
+    assert_eq!(initial_matches, initial_expected_paths);
+
+    watcher.remove(&alias_dir).unwrap();
+
+    fs.write(&real_file, b"second").await.unwrap();
+    let remaining_expected_paths = BTreeSet::from([real_file.clone()]);
+    let remaining_matches =
+        collect_matching_event_paths(&executor, &mut events, &remaining_expected_paths).await;
+
+    assert_eq!(remaining_matches, remaining_expected_paths);
+}
+
+#[gpui::test]
+#[cfg(target_os = "linux")]
+async fn test_realfs_watch_symlink_alias_preserves_original_root_path_for_root_events(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
+    cx.executor().allow_parking();
+
+    let tempdir = TempDir::new().unwrap();
+    let root = tempdir.path();
+    let fs = RealFs::new(None, executor.clone());
+
+    let real_dir = root.join("real");
+    let alias_dir = root.join("alias");
+
+    std::fs::create_dir_all(&real_dir).unwrap();
+    std::os::unix::fs::symlink("real", &alias_dir).unwrap();
+
+    let (mut events, watcher) = fs.watch(root, Duration::from_millis(10)).await;
+    watcher.add(&alias_dir).unwrap();
+
+    std::fs::remove_dir(&real_dir).unwrap();
+
+    let matched_events = collect_matching_events(&executor, &mut events, |event| {
+        event.path == alias_dir && event.kind == Some(PathEventKind::Removed)
+    })
+    .await;
+
+    assert!(
+        !matched_events.is_empty(),
+        "expected remove event for watched alias root {alias_dir:?}"
+    );
 }
 
 #[gpui::test]

@@ -3,7 +3,7 @@ use parking_lot::Mutex;
 use std::{
     collections::{BTreeMap, HashMap},
     ops::DerefMut,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, OnceLock},
 };
 use util::{ResultExt, paths::SanitizedPath};
@@ -14,6 +14,7 @@ pub struct FsWatcher {
     tx: smol::channel::Sender<()>,
     pending_path_events: Arc<Mutex<Vec<PathEvent>>>,
     registrations: Mutex<BTreeMap<Arc<std::path::Path>, WatcherRegistrationId>>,
+    followed_registrations: Mutex<BTreeMap<Arc<std::path::Path>, WatcherRegistrationId>>,
 }
 
 impl FsWatcher {
@@ -25,6 +26,7 @@ impl FsWatcher {
             tx,
             pending_path_events,
             registrations: Default::default(),
+            followed_registrations: Default::default(),
         }
     }
 }
@@ -32,13 +34,19 @@ impl FsWatcher {
 impl Drop for FsWatcher {
     fn drop(&mut self) {
         let mut registrations = BTreeMap::new();
+        let mut followed_registrations = BTreeMap::new();
         {
             let old = &mut self.registrations.lock();
             std::mem::swap(old.deref_mut(), &mut registrations);
+            let old = &mut self.followed_registrations.lock();
+            std::mem::swap(old.deref_mut(), &mut followed_registrations);
         }
 
         let _ = global(|g| {
             for (_, registration) in registrations {
+                g.remove(registration);
+            }
+            for (_, registration) in followed_registrations {
                 g.remove(registration);
             }
         });
@@ -79,18 +87,26 @@ impl Watcher for FsWatcher {
             }
         }
 
-        let root_path = SanitizedPath::new_arc(path);
-        let path: Arc<std::path::Path> = path.into();
+        let original_root_path: Arc<std::path::Path> = path.into();
+        #[cfg(target_os = "linux")]
+        let watch_path: Arc<std::path::Path> = {
+            // Canonicalize here so symlink aliases share one inotify watch.
+            // Keep registrations keyed by the original path so callers retain
+            // independent lifetimes via GlobalWatcher's refcount.
+            std::fs::canonicalize(path)
+                .map(Into::into)
+                .unwrap_or_else(|_| original_root_path.clone())
+        };
+        #[cfg(not(target_os = "linux"))]
+        let watch_path = original_root_path.clone();
+        let canonical_watch_root_path = SanitizedPath::new_arc(&watch_path);
 
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         let mode = notify::RecursiveMode::Recursive;
         #[cfg(target_os = "linux")]
         let mode = notify::RecursiveMode::NonRecursive;
 
-        let registration_path = path.clone();
         let registration_id = global({
-            let watch_path = path.clone();
-            let callback_path = path;
             |g| {
                 g.add(watch_path, mode, move |event: &notify::Event| {
                     log::trace!("watcher received event: {event:?}");
@@ -105,23 +121,35 @@ impl Watcher for FsWatcher {
                         .iter()
                         .filter_map(|event_path| {
                             let event_path = SanitizedPath::new(event_path);
-                            event_path.starts_with(&root_path).then(|| PathEvent {
-                                path: event_path.as_path().to_path_buf(),
-                                kind,
-                            })
+                            #[cfg(target_os = "linux")]
+                            {
+                                translate_canonical_event_path(
+                                    event_path.as_path(),
+                                    canonical_watch_root_path.as_path(),
+                                    original_root_path.as_ref(),
+                                )
+                                .map(|path| PathEvent { path, kind })
+                            }
+                            #[cfg(not(target_os = "linux"))]
+                            {
+                                event_path.starts_with(SanitizedPath::new(original_root_path.as_ref())).then(|| PathEvent {
+                                    path: event_path.as_path().to_path_buf(),
+                                    kind,
+                                })
+                            }
                         })
                         .collect::<Vec<_>>();
 
                     let is_rescan_event = event.need_rescan();
                     if is_rescan_event {
                         log::warn!(
-                            "filesystem watcher lost sync for {callback_path:?}; scheduling rescan"
+                            "filesystem watcher lost sync for {original_root_path:?}; scheduling rescan"
                         );
                         // we only keep the first event per path below, this ensures it will be the rescan event
                         // we'll remove any existing pending events for the same reason once we have the lock below
-                        path_events.retain(|p| &p.path != callback_path.as_ref());
+                        path_events.retain(|p| &p.path != original_root_path.as_ref());
                         path_events.push(PathEvent {
-                            path: callback_path.to_path_buf(),
+                            path: original_root_path.to_path_buf(),
                             kind: Some(PathEventKind::Rescan),
                         });
                     }
@@ -146,18 +174,62 @@ impl Watcher for FsWatcher {
 
         self.registrations
             .lock()
-            .insert(registration_path, registration_id);
+            .insert(path.into(), registration_id);
 
         Ok(())
     }
 
+    fn add_followed_path(
+        &self,
+        _removable_path: &std::path::Path,
+        watched_path: &std::path::Path,
+    ) -> anyhow::Result<()> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            return self.add(watched_path);
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            if self
+                .followed_registrations
+                .lock()
+                .contains_key(_removable_path)
+            {
+                return Ok(());
+            }
+
+            let removable_path: Arc<std::path::Path> = _removable_path.into();
+            let watch_path: Arc<std::path::Path> = std::fs::canonicalize(watched_path)
+                .map(Into::into)
+                .unwrap_or_else(|_| watched_path.into());
+
+            let registration_id = global({
+                |g| g.add(watch_path, notify::RecursiveMode::NonRecursive, |_event| {})
+            })??;
+
+            self.followed_registrations
+                .lock()
+                .insert(removable_path, registration_id);
+
+            Ok(())
+        }
+    }
+
     fn remove(&self, path: &std::path::Path) -> anyhow::Result<()> {
         log::trace!("remove watched path: {path:?}");
-        let Some(registration) = self.registrations.lock().remove(path) else {
+        let registration = self.registrations.lock().remove(path);
+        let followed_registration = self.followed_registrations.lock().remove(path);
+        let Some(registration) = registration.or(followed_registration) else {
             return Ok(());
         };
 
-        global(|w| w.remove(registration))
+        global(|w| {
+            w.remove(registration);
+            if let Some(followed_registration) = followed_registration {
+                w.remove(followed_registration);
+            }
+        })
     }
 }
 
@@ -209,6 +281,19 @@ fn coalesce_pending_rescans(pending_paths: &mut Vec<PathEvent>, path_events: &mu
 
 fn is_covered_rescan(kind: Option<PathEventKind>, path: &Path, ancestor: &Path) -> bool {
     kind == Some(PathEventKind::Rescan) && path != ancestor && path.starts_with(ancestor)
+}
+
+fn translate_canonical_event_path(
+    event_path: &Path,
+    canonical_root: &Path,
+    original_root: &Path,
+) -> Option<PathBuf> {
+    let relative = event_path.strip_prefix(canonical_root).ok()?;
+    if relative.as_os_str().is_empty() {
+        Some(original_root.to_path_buf())
+    } else {
+        Some(original_root.join(relative))
+    }
 }
 
 #[derive(Default, Debug, Copy, Clone, PartialEq, Eq, Hash)]

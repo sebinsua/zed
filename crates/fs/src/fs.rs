@@ -69,6 +69,10 @@ use std::ffi::OsStr;
 
 pub trait Watcher: Send + Sync {
     fn add(&self, path: &Path) -> Result<()>;
+    fn add_followed_path(&self, removable_path: &Path, watched_path: &Path) -> Result<()> {
+        let _ = removable_path;
+        self.add(watched_path)
+    }
     fn remove(&self, path: &Path) -> Result<()>;
 }
 
@@ -1098,7 +1102,7 @@ impl Fs for RealFs {
                     target = SanitizedPath::new(&canonical).as_path().to_path_buf();
                 }
             }
-            watcher.add(&target).ok();
+            watcher.add_followed_path(path, &target).ok();
             if let Some(parent) = target.parent() {
                 watcher.add(parent).log_err();
             }
@@ -1286,6 +1290,10 @@ impl Fs for RealFs {
 #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
 impl Watcher for RealWatcher {
     fn add(&self, _: &Path) -> Result<()> {
+        Ok(())
+    }
+
+    fn add_followed_path(&self, _: &Path, _: &Path) -> Result<()> {
         Ok(())
     }
 
@@ -2562,6 +2570,10 @@ impl Watcher for FakeWatcher {
             .push((path.to_owned(), self.tx.clone()));
         self.prefixes.lock().push(path.to_owned());
         Ok(())
+    }
+
+    fn add_followed_path(&self, _: &Path, watched_path: &Path) -> Result<()> {
+        self.add(watched_path)
     }
 
     fn remove(&self, _: &Path) -> Result<()> {
