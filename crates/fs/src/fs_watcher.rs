@@ -59,7 +59,7 @@ impl Watcher for FsWatcher {
         let tx = self.tx.clone();
         let pending_paths = self.pending_path_events.clone();
 
-        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        #[cfg(target_os = "windows")]
         {
             // Return early if an ancestor of this path was already being watched.
             // saves a huge amount of memory
@@ -73,6 +73,24 @@ impl Watcher for FsWatcher {
                 .next_back()
                 && path.starts_with(watched_path.as_ref())
             {
+                log::trace!(
+                    "path to watch is covered by existing registration: {path:?}, {watched_path:?}"
+                );
+                return Ok(());
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            if macos_recursive_registration_is_covered(&self.registrations.lock(), path) {
+                let watched_path = self
+                    .registrations
+                    .lock()
+                    .range::<std::path::Path, _>((
+                        std::ops::Bound::Unbounded,
+                        std::ops::Bound::Included(path),
+                    ))
+                    .next_back()
+                    .map(|(watched_path, _)| watched_path.clone());
                 log::trace!(
                     "path to watch is covered by existing registration: {path:?}, {watched_path:?}"
                 );
@@ -97,7 +115,13 @@ impl Watcher for FsWatcher {
                 .map(Into::into)
                 .unwrap_or_else(|_| original_root_path.clone())
         };
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        let watch_path: Arc<std::path::Path> = {
+            std::fs::canonicalize(path)
+                .map(Into::into)
+                .unwrap_or_else(|_| original_root_path.clone())
+        };
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let watch_path = original_root_path.clone();
         let canonical_watch_root_path = SanitizedPath::new_arc(&watch_path);
 
@@ -121,7 +145,7 @@ impl Watcher for FsWatcher {
                         .iter()
                         .filter_map(|event_path| {
                             let event_path = SanitizedPath::new(event_path);
-                            #[cfg(target_os = "linux")]
+                            #[cfg(any(target_os = "linux", target_os = "macos"))]
                             {
                                 translate_canonical_event_path(
                                     event_path.as_path(),
@@ -130,7 +154,7 @@ impl Watcher for FsWatcher {
                                 )
                                 .map(|path| PathEvent { path, kind })
                             }
-                            #[cfg(not(target_os = "linux"))]
+                            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                             {
                                 event_path.starts_with(SanitizedPath::new(original_root_path.as_ref())).then(|| PathEvent {
                                     path: event_path.as_path().to_path_buf(),
@@ -182,11 +206,91 @@ impl Watcher for FsWatcher {
     fn add_followed_path(
         &self,
         _removable_path: &std::path::Path,
-        watched_path: &std::path::Path,
+        _watched_path: &std::path::Path,
     ) -> anyhow::Result<()> {
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
         {
-            return self.add(watched_path);
+            return Ok(());
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            if self
+                .followed_registrations
+                .lock()
+                .contains_key(_removable_path)
+            {
+                return Ok(());
+            }
+
+            let removable_path: Arc<std::path::Path> = _removable_path.into();
+            let original_root_path = removable_path.clone();
+            let watch_path: Arc<std::path::Path> = _watched_path.into();
+            let canonical_watch_root_path = SanitizedPath::new_arc(&watch_path);
+            let tx = self.tx.clone();
+            let pending_paths = self.pending_path_events.clone();
+
+            let registration_id = global({
+                move |g| {
+                    g.add(watch_path, notify::RecursiveMode::Recursive, move |event| {
+                        log::trace!("watcher received event: {event:?}");
+                        let kind = match event.kind {
+                            EventKind::Create(_) => Some(PathEventKind::Created),
+                            EventKind::Modify(_) => Some(PathEventKind::Changed),
+                            EventKind::Remove(_) => Some(PathEventKind::Removed),
+                            _ => None,
+                        };
+                        let mut path_events = event
+                            .paths
+                            .iter()
+                            .filter_map(|event_path| {
+                                let event_path = SanitizedPath::new(event_path);
+                                {
+                                    translate_canonical_event_path(
+                                        event_path.as_path(),
+                                        canonical_watch_root_path.as_path(),
+                                        original_root_path.as_ref(),
+                                    )
+                                    .map(|path| PathEvent { path, kind })
+                                }
+                            })
+                            .collect::<Vec<_>>();
+
+                        if event.need_rescan() {
+                            log::warn!(
+                                "filesystem watcher lost sync for {original_root_path:?}; scheduling rescan"
+                            );
+                            path_events.retain(|path_event| {
+                                path_event.path != original_root_path.as_ref()
+                            });
+                            path_events.push(PathEvent {
+                                path: original_root_path.to_path_buf(),
+                                kind: Some(PathEventKind::Rescan),
+                            });
+                        }
+
+                        if !path_events.is_empty() {
+                            path_events.sort();
+                            let mut pending_paths = pending_paths.lock();
+                            if pending_paths.is_empty() {
+                                tx.try_send(()).ok();
+                            }
+                            coalesce_pending_rescans(&mut pending_paths, &mut path_events);
+                            util::extend_sorted(
+                                &mut *pending_paths,
+                                path_events,
+                                usize::MAX,
+                                |left, right| left.path.cmp(&right.path),
+                            );
+                        }
+                    })
+                }
+            })??;
+
+            self.followed_registrations
+                .lock()
+                .insert(removable_path, registration_id);
+            return Ok(());
         }
 
         #[cfg(target_os = "linux")]
@@ -200,9 +304,9 @@ impl Watcher for FsWatcher {
             }
 
             let removable_path: Arc<std::path::Path> = _removable_path.into();
-            let watch_path: Arc<std::path::Path> = std::fs::canonicalize(watched_path)
+            let watch_path: Arc<std::path::Path> = std::fs::canonicalize(_watched_path)
                 .map(Into::into)
-                .unwrap_or_else(|_| watched_path.into());
+                .unwrap_or_else(|_| _watched_path.into());
 
             let registration_id = global({
                 |g| g.add(watch_path, notify::RecursiveMode::NonRecursive, |_event| {})
@@ -294,6 +398,64 @@ fn translate_canonical_event_path(
     } else {
         Some(original_root.join(relative))
     }
+}
+
+#[cfg(target_os = "macos")]
+fn path_is_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_recursive_registration_is_covered(
+    registrations: &BTreeMap<Arc<std::path::Path>, WatcherRegistrationId>,
+    path: &Path,
+) -> bool {
+    let Some((watched_path, _)) = registrations
+        .range::<std::path::Path, _>((
+            std::ops::Bound::Unbounded,
+            std::ops::Bound::Included(path),
+        ))
+        .next_back()
+    else {
+        return false;
+    };
+
+    if path == watched_path.as_ref() {
+        return true;
+    }
+
+    if !path.starts_with(watched_path.as_ref()) {
+        return false;
+    }
+
+    if path_is_symlink(watched_path) {
+        return true;
+    }
+
+    if path_is_symlink(path) {
+        return false;
+    }
+
+    !path_has_intermediate_symlink(watched_path, path)
+}
+
+#[cfg(target_os = "macos")]
+fn path_has_intermediate_symlink(ancestor: &Path, descendant: &Path) -> bool {
+    let Ok(relative_path) = descendant.strip_prefix(ancestor) else {
+        return false;
+    };
+
+    let mut current_path = ancestor.to_path_buf();
+    for component in relative_path.components() {
+        current_path.push(component);
+        if current_path != descendant && path_is_symlink(&current_path) {
+            return true;
+        }
+    }
+
+    false
 }
 
 #[derive(Default, Debug, Copy, Clone, PartialEq, Eq, Hash)]
@@ -397,6 +559,8 @@ static FS_WATCHER_INSTANCE: OnceLock<anyhow::Result<GlobalWatcher, notify::Error
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    use tempfile::TempDir;
 
     fn rescan(path: &str) -> PathEvent {
         PathEvent {
@@ -410,6 +574,142 @@ mod tests {
             path: PathBuf::from(path),
             kind: Some(PathEventKind::Changed),
         }
+    }
+
+    #[test]
+    fn test_translate_canonical_event_path_maps_canonical_prefix_to_original_prefix() {
+        assert_eq!(
+            translate_canonical_event_path(
+                Path::new("/root/real/file.txt"),
+                Path::new("/root/real"),
+                Path::new("/root/alias"),
+            ),
+            Some(PathBuf::from("/root/alias/file.txt"))
+        );
+    }
+
+    #[test]
+    fn test_translate_canonical_event_path_preserves_original_root_path_for_root_events() {
+        assert_eq!(
+            translate_canonical_event_path(
+                Path::new("/root/real"),
+                Path::new("/root/real"),
+                Path::new("/root/alias"),
+            ),
+            Some(PathBuf::from("/root/alias"))
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_macos_recursive_registration_is_covered_for_regular_descendants() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let regular_dir = root.join("regular");
+
+        std::fs::create_dir_all(&regular_dir).unwrap();
+
+        let registrations = BTreeMap::from([(root.into(), WatcherRegistrationId(1))]);
+        assert!(macos_recursive_registration_is_covered(
+            &registrations,
+            &regular_dir
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_macos_recursive_registration_is_not_covered_for_symlink_roots() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let real_dir = root.join("real");
+        let alias_dir = root.join("alias");
+
+        std::fs::create_dir_all(&real_dir).unwrap();
+        std::os::unix::fs::symlink("real", &alias_dir).unwrap();
+
+        let registrations = BTreeMap::from([(root.into(), WatcherRegistrationId(1))]);
+        assert!(!macos_recursive_registration_is_covered(
+            &registrations,
+            &alias_dir
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_macos_recursive_registration_is_covered_for_exact_symlink_root_matches() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let real_dir = root.join("real");
+        let alias_dir = root.join("alias");
+
+        std::fs::create_dir_all(&real_dir).unwrap();
+        std::os::unix::fs::symlink("real", &alias_dir).unwrap();
+
+        let registrations = BTreeMap::from([(alias_dir.clone().into(), WatcherRegistrationId(1))]);
+        assert!(macos_recursive_registration_is_covered(
+            &registrations,
+            &alias_dir
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_macos_recursive_registration_is_covered_for_symlink_descendants() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let real_dir = root.join("real");
+        let nested_dir = real_dir.join("nested");
+        let alias_dir = root.join("alias");
+        let alias_nested_dir = alias_dir.join("nested");
+
+        std::fs::create_dir_all(&nested_dir).unwrap();
+        std::os::unix::fs::symlink("real", &alias_dir).unwrap();
+
+        let registrations = BTreeMap::from([(alias_dir.into(), WatcherRegistrationId(1))]);
+        assert!(macos_recursive_registration_is_covered(
+            &registrations,
+            &alias_nested_dir
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_macos_recursive_registration_is_not_covered_beneath_intermediate_symlink() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let real_dir = root.join("real");
+        let nested_dir = real_dir.join("nested");
+        let alias_dir = root.join("alias");
+        let alias_nested_dir = alias_dir.join("nested");
+
+        std::fs::create_dir_all(&nested_dir).unwrap();
+        std::os::unix::fs::symlink("real", &alias_dir).unwrap();
+
+        let registrations = BTreeMap::from([(root.into(), WatcherRegistrationId(1))]);
+        assert!(!macos_recursive_registration_is_covered(
+            &registrations,
+            &alias_nested_dir
+        ));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_followed_registrations_are_keyed_by_removable_path_on_non_linux() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let watched_dir = root.join("watched");
+        let removable_path = root.join("alias");
+
+        std::fs::create_dir_all(&watched_dir).unwrap();
+        let watcher = FsWatcher::new(smol::channel::unbounded().0, Default::default());
+
+        watcher
+            .add_followed_path(&removable_path, &watched_dir)
+            .unwrap();
+
+        let followed_registrations = watcher.followed_registrations.lock();
+        assert!(followed_registrations.contains_key(removable_path.as_path()));
+        assert!(!followed_registrations.contains_key(watched_dir.as_path()));
     }
 
     struct TestCase {
